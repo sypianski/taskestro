@@ -22,7 +22,7 @@ git worktree and tmux window, with the appropriate model selected per task.
 This skill turns a TODO file into parallel development streams:
 
 ```
-TODO.md → parse tasks → estimate complexity → create worktrees → launch tmux → claude CLI
+TODO.md → parse tasks → estimate complexity → create worktrees → launch tmux → claude CLI → monitor → merge
 ```
 
 ## Step 1: Locate and Parse the Task File
@@ -254,33 +254,155 @@ Instructions:
 - If you encounter blockers or ambiguity, write them to BLOCKERS.md instead of guessing
 ```
 
-## Step 6: Wait for Completion
+## Step 6: Launch Monitor Window
 
-After launching all sessions, **poll until every subagent finishes**.
-Do NOT hand off monitoring to the user — the orchestrator owns the full lifecycle.
-
-### Polling loop
-
-Check every 30 seconds whether each window's process is still `claude`:
+Before starting the polling loop, create a dedicated monitor window that gives the
+user a live dashboard of all tasks. This is the **first window created** — it stays
+in the foreground so the user sees progress without switching between task windows.
 
 ```bash
-for window in "${TASK_WINDOWS[@]}"; do
-  CMD=$(tmux list-panes -t "$SESSION_NAME:$window" -F '#{pane_current_command}')
-  if [ "$CMD" = "fish" ] || [ "$CMD" = "bash" ]; then
-    # claude exited — this task is done
+tmux new-window -t "$SESSION_NAME" -n "monitor"
+```
+
+### Monitor script
+
+Write a bash script to the project root (`.task-monitor.sh`) and run it in the
+monitor window. The script loops every 10 seconds and redraws the dashboard.
+
+```bash
+#!/usr/bin/env bash
+SESSION="$1"
+BASE_BRANCH="$2"
+shift 2
+# Remaining args: pairs of "window_name:model:worktree_path"
+TASKS=("$@")
+
+while true; do
+  clear
+  echo "╔══════════════════════════════════════════════════════════════════╗"
+  echo "║  TASK ORCHESTRATOR MONITOR                    $(date +%H:%M:%S)        ║"
+  echo "╠══════════════════════════════════════════════════════════════════╣"
+  printf "║  %-3s  %-28s %-8s %-18s ║\n" "#" "TASK" "MODEL" "STATUS"
+  echo "╠══════════════════════════════════════════════════════════════════╣"
+
+  ALL_DONE=true
+  IDX=1
+
+  for entry in "${TASKS[@]}"; do
+    IFS=':' read -r WINDOW MODEL WTPATH <<< "$entry"
+
+    # Check if claude is still running
+    CMD=$(tmux list-panes -t "$SESSION:$WINDOW" -F '#{pane_current_command}' 2>/dev/null)
+
+    if [ "$CMD" = "claude" ]; then
+      # Try to detect if waiting for user input
+      CAPTURE=$(tmux capture-pane -t "$SESSION:$WINDOW" -p 2>/dev/null | tail -5)
+      if echo "$CAPTURE" | grep -qiE '(Y/n|y/N|\? |permission|allow|approve|deny)'; then
+        STATUS="!! NEEDS INPUT"
+      else
+        STATUS=".. working"
+      fi
+      ALL_DONE=false
+    elif [ -z "$CMD" ]; then
+      STATUS="?? window gone"
+    else
+      # Claude exited — check result
+      if [ -d "$WTPATH" ]; then
+        COMMITS=$(git -C "$WTPATH" log "$BASE_BRANCH"..HEAD --oneline 2>/dev/null | wc -l)
+        if [ "$COMMITS" -gt 0 ]; then
+          if [ -f "$WTPATH/BLOCKERS.md" ]; then
+            STATUS="~~ done (blockers)"
+          else
+            STATUS="OK done ($COMMITS commits)"
+          fi
+        else
+          STATUS="-- no changes"
+        fi
+      else
+        STATUS="OK merged"
+      fi
+    fi
+
+    printf "║  %-3s  %-28s %-8s %-18s ║\n" "$IDX" "$WINDOW" "$MODEL" "$STATUS"
+    IDX=$((IDX + 1))
+  done
+
+  echo "╠══════════════════════════════════════════════════════════════════╣"
+  echo "║  Jump to task: press prefix then <number>                      ║"
+  echo "║  !! = needs your input — switch to that window                 ║"
+  echo "╚══════════════════════════════════════════════════════════════════╝"
+
+  if $ALL_DONE; then
+    echo ""
+    echo "All tasks finished. Returning to orchestrator..."
+    exit 0
   fi
+
+  sleep 10
 done
 ```
 
-While waiting, print a compact status update each cycle so the user sees progress:
+### Launching the monitor
 
+```bash
+chmod +x .task-monitor.sh
+
+# Build the task entries as "window:model:worktree_path" pairs
+TASK_ARGS=()
+for i in "${!TASK_WINDOWS[@]}"; do
+  TASK_ARGS+=("${TASK_WINDOWS[$i]}:${TASK_MODELS[$i]}:${TASK_WORKTREES[$i]}")
+done
+
+tmux send-keys -t "$SESSION_NAME:monitor" \
+  "bash .task-monitor.sh '$SESSION_NAME' '$BASE_BRANCH' ${TASK_ARGS[*]}" Enter
 ```
-[12:03:42] ⏳ redesign-auth (opus)  |  ✅ add-pagination  |  ✅ fix-readme-typo
+
+### Detecting "needs input"
+
+The monitor captures the last 5 lines of each task pane and looks for input
+prompts (`Y/n`, `permission`, `allow`, `approve`). This catches Claude Code's
+permission dialogs. When detected, the status shows `!! NEEDS INPUT` to alert
+the user to switch to that window.
+
+Since Claude Code uses the alternate screen buffer, `capture-pane -p` may
+return partial or empty content. The monitor uses it as a best-effort heuristic:
+- If capture works and matches input patterns → `!! NEEDS INPUT`
+- If capture is empty but `pane_current_command` is `claude` → `.. working`
+- Trust `pane_current_command` over capture content for running/finished state
+
+### Navigation
+
+The user stays in the monitor window and can jump to any task window using
+tmux's standard window switching (prefix + window number, or prefix + n/p).
+The monitor shows the task number corresponding to the tmux window index.
+
+After switching to a task window to provide input, the user returns to the
+monitor with prefix + selecting the monitor window.
+
+## Step 7: Wait for Completion
+
+The orchestrator polls alongside the monitor (or relies on the monitor script's
+exit as the signal). **The monitor script exits with 0 when all tasks finish.**
+
+### Orchestrator polling
+
+The orchestrator's own polling loop checks the monitor process:
+
+```bash
+# Wait for monitor to exit (= all tasks done)
+MONITOR_PID=$(tmux list-panes -t "$SESSION_NAME:monitor" -F '#{pane_pid}')
+while kill -0 "$MONITOR_PID" 2>/dev/null; do
+  sleep 15
+done
 ```
+
+Alternatively, the orchestrator can poll independently using the same
+`pane_current_command` check as before — the monitor is a convenience for
+the user, not a dependency for the orchestrator logic.
 
 ### Detecting success vs failure
 
-After claude exits in a window, check for new commits on the worktree branch:
+After all tasks finish, check each worktree for results:
 
 ```bash
 cd <worktree-path>
@@ -297,7 +419,7 @@ HAS_BLOCKERS=$(test -f BLOCKERS.md && echo yes || echo no)
 If a task runs longer than **30 minutes**, warn the user but keep waiting.
 Only ask about killing if it exceeds **60 minutes**. Do not kill automatically.
 
-## Step 7: Merge Results
+## Step 8: Merge Results
 
 Once **all** tasks are done (or the user decides to proceed with completed ones),
 merge each successful branch back into the base branch.
@@ -353,7 +475,7 @@ Merge complete:
 Remaining worktrees: none
 ```
 
-## Step 8: Report
+## Step 9: Report
 
 Provide the user with:
 
