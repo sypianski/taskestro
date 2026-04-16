@@ -21,24 +21,41 @@ Fix typo in README                | haiku  | wt/fix-readme-typo
 ```
 
 4. After your OK, it opens a tmux window for each task, each with its own Claude Code session and git worktree
-5. It waits for all sessions to finish, polling every 30s
-6. Once done, it merges each branch back, resolves simple conflicts automatically, and updates `TASKS.md` with results
+5. A dedicated **monitor window** (running `expedi-rigardi -w`) gives you a live dashboard of every task — state (`working`, `awaiting-input`, `done`), age since last activity, and the prompt when a task needs your input
+6. Each child drops a `.expedi.done` marker on exit so the orchestrator can detect completion without racing on `pane_current_command`
+7. Once all markers are present, it merges each branch back, resolves simple conflicts automatically, and updates `TASKS.md` with results
 
 You save time, save tokens (smaller models handle simple tasks), and everything stays visible in one tmux session. No more switching between windows to check progress — the orchestrator tracks it for you.
 
 ## What it does under the hood
 
 ```
-TASKS.md → parse → estimate complexity → select model → create worktrees → launch tmux → claude CLI → poll → merge → report
+TASKS.md → parse → estimate complexity → select model → create worktrees → launch tmux → claude CLI → monitor → markers → merge → report
 ```
 
 1. **Parses** your task file (checkbox, header-based, or tagged formats)
 2. **Estimates complexity** and picks the right Claude model (Haiku / Sonnet / Opus)
 3. **Creates git worktrees** so each task works on an isolated branch
 4. **Launches tmux windows** with interactive Claude Code sessions
-5. **Polls** until every session finishes
-6. **Merges** branches back, handles simple conflicts automatically
-7. **Reports** what was merged, what had issues, cleans up worktrees
+5. **Opens a monitor window** running `expedi-rigardi -w` — live dashboard of all tasks
+6. **Waits on completion markers** — each child writes `.expedi.done` in its worktree when claude exits, so the orchestrator polls the filesystem instead of the (racy) `pane_current_command`
+7. **Merges** branches back, handles simple conflicts automatically
+8. **Reports** what was merged, what had issues, cleans up worktrees
+
+## The monitor (`expedi-rigardi`)
+
+The orchestrator relies on a separate Fish function, `expedi-rigardi`, to render the live dashboard. It scans every tmux pane in the current session whose `pane_current_path` matches `*/.worktrees/*` and reports:
+
+- **State**: `awaiting-input` (!), `working` (●), `interrupted` (✗), `idle` (○), `done` (✓) — sorted by priority
+- **Age** since last Claude activity (from a `Notification` hook that timestamps prompts to `~/.cache/cc-monitor/`)
+- **The actual question** when a task is waiting for your input
+
+Modes:
+- `expedi-rigardi` — single-shot table
+- `expedi-rigardi -w` — refresh every 2s until Ctrl-C (what the orchestrator uses)
+- `expedi-rigardi --bar` — one-line summary for tmux status bar
+
+See [`expedi-rigardi.fish`](https://github.com/sypianski/dotfiles/blob/master/fish/functions/expedi-rigardi.fish) and the [`cc-monitor-notify.sh` hook](https://github.com/sypianski/dotfiles/blob/master/hooks/cc-monitor-notify.sh) in `sypianski/dotfiles`.
 
 ## Installation
 
@@ -73,6 +90,8 @@ Use `[haiku]`, `[sonnet]`, or `[opus]` tags to override automatic model selectio
 - Git (for worktrees)
 - tmux
 - [Claude Code CLI](https://claude.ai/code)
+- **Fish shell** + the `expedi-rigardi` function (for the live monitor — see above)
+- A `Notification` hook configured in Claude Code settings (optional, enables activity-age in the monitor)
 
 ## License
 
