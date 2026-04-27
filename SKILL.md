@@ -302,7 +302,7 @@ matches `*/.worktrees/*` (or the legacy `*/worktrees/wt-*`).
 ### What the monitor shows
 
 - States: `awaiting-input` (!), `working` (●), `interrupted` (✗), `idle` (○), `done` (✓)
-- Age since last activity (from the `Notification` hook at `~/dotfiles/hooks/cc-monitor-notify.sh`)
+- Age since last activity (from the `Notification` hook at `hooks/cc-monitor-notify.sh` in this repo — see [Hook installation](#hook-installation) below)
 - The prompt question when a task is awaiting input
 - Sorted: awaiting-input > working > interrupted > idle > done
 
@@ -314,54 +314,72 @@ from a list).
 
 ## Step 7: Wait for Completion
 
-The orchestrator is a Claude Code instance — it cannot run an unbounded
-background loop, because once its last tool call returns it goes idle waiting
-for user input. The fix is a **bounded** bash poll that blocks inside a single
-Bash tool call, then re-invokes itself until all children have dropped their
-`.task.done` markers (written in Step 5).
+Parent claude cannot poll forever — once a tool call returns it goes idle until the next user input. Instead, **let the worktrees push completion events to the parent** via inotify + the `Monitor` tool. Each `.task.done` write emits one notification line, which Claude Code delivers to parent claude as a fresh turn.
 
-### Orchestrator polling
+### Setup
 
-Issue this as **one Bash call** per cycle. It exits 0 when all markers are
-present, non-zero on the ~9-minute timeout. If it times out, call it again.
-When it exits 0 → proceed to merge.
+`inotify-tools` must be installed (`sudo apt install inotify-tools` once per host; Linux only — on macOS use `fswatch`). Verify:
 
 ```bash
-# TASK_WORKTREES is the array of worktree paths from Step 5.
-# Bounded ~9 min so the Bash tool's 10-min ceiling never fires.
-DEADLINE=$(( $(date +%s) + 540 ))
-while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-  ALL_DONE=true
-  for WT in "${TASK_WORKTREES[@]}"; do
-    [ -f "$WT/.task.done" ] || { ALL_DONE=false; break; }
-  done
-  if $ALL_DONE; then
-    echo "all tasks done"
-    exit 0
-  fi
-  sleep 15
+command -v inotifywait || { echo "install inotify-tools"; exit 1; }
+```
+
+### Drain pre-existing markers first
+
+Parent may have restarted while children were running. Count markers that already exist before subscribing to new events:
+
+```bash
+EXPECTED=${#TASK_WORKTREES[@]}
+ALREADY=0
+for WT in "${TASK_WORKTREES[@]}"; do
+  [ -f "$WT/.task.done" ] && ALREADY=$((ALREADY + 1))
 done
-echo "timeout — rerun to keep waiting"
-exit 1
+REMAINING=$((EXPECTED - ALREADY))
+echo "completed: $ALREADY / $EXPECTED"
+[ "$REMAINING" -eq 0 ] && exit 0   # nothing to wait for, jump to merge
 ```
 
-Once all markers are present, kill the monitor window before moving to merge:
+### Subscribe to completion events via the Monitor tool
+
+Run the following as a `Monitor` tool call (NOT plain `Bash`). Each line of stdout is delivered to parent claude as one notification, instantly waking it up:
 
 ```bash
-tmux kill-window -t "$SESSION_NAME:monitor" 2>/dev/null
+inotifywait -m -e close_write,moved_to --format '%w%f' \
+    "${TASK_WORKTREES[@]}" 2>/dev/null \
+  | awk -F/ '/\.task\.done$/ { print "DONE", $(NF-1); fflush() }'
 ```
+
+How it works:
+- `-m` = monitor mode, never exits.
+- `-e close_write,moved_to` = catches both `touch .task.done` and atomic moves.
+- `--format '%w%f'` emits the full path of each event.
+- `awk` filters for `.task.done`, prints `DONE <slug>` (`<slug>` = parent dir name = worktree slug). `fflush()` defeats stdio buffering so parent sees each line immediately.
+
+### Counting and exiting
+
+Parent claude tracks notifications:
+
+- On each `DONE <slug>` notification, decrement `REMAINING` and dedupe by slug (in case both `close_write` and `moved_to` fire for the same file).
+- When `REMAINING == 0` → call `TaskStop` on the Monitor task ID, then `tmux kill-window -t "$SESSION_NAME:monitor"`, then proceed to Step 8 (merge).
+
+### Why this beats the old bash-poll loop
+
+- **Push, not poll.** Zero-latency wake-up: parent reacts within milliseconds of `touch .task.done`, not within the next poll cycle.
+- **Parent stays asleep between events.** No 9-minute Bash hostage; the `Monitor` task lives quietly in the harness, waking parent only when something actually happens.
+- **Survives parent restart.** Fresh start re-runs the marker drain (above), then re-subscribes — both already-done and not-yet-done are handled correctly.
+- **Lower noise.** No timeout-and-rerun loop that the parent might forget to re-invoke.
 
 ### Why markers instead of `pane_current_command`
 
-`pane_current_command` worked for the dashboard but is racy for completion
-detection: between claude exiting and the shell prompt redrawing, the value
-can briefly read as `bash`/`fish` even while claude is still live. A filesystem
-marker written after claude exits is atomic and persists across orchestrator
-restarts.
+`pane_current_command` worked for the dashboard but is racy for completion detection: between claude exiting and the shell prompt redrawing, the value can briefly read as `bash`/`fish` even while claude is still live. A filesystem marker written after claude exits is atomic, survives parent restart, and is exactly what `inotifywait` is good at observing.
+
+### Backstop
+
+If the `Monitor` task dies (rare: kernel watch limit hit, `inotifywait` killed by oomkiller, etc.), parent has no way to know without help. Set a `ScheduleWakeup` for ~10 minutes when subscribing — on wake, re-run the marker drain. If `REMAINING` dropped without notifications arriving, the Monitor died; restart it and reschedule.
 
 ### Detecting success vs failure
 
-After all tasks finish, check each worktree for results:
+After all markers are present, check each worktree for results:
 
 ```bash
 cd <worktree-path>
@@ -373,10 +391,9 @@ HAS_BLOCKERS=$(test -f BLOCKERS.md && echo yes || echo no)
 - **New commits + BLOCKERS.md** → partial success, note in final report but still merge
 - **No new commits** → task failed or produced no changes, skip and note in report
 
-### Timeout
+### Soft warnings
 
-If a task runs longer than **30 minutes**, warn the user but keep waiting.
-Only ask about killing if it exceeds **60 minutes**. Do not kill automatically.
+If a single task takes >30 minutes (no `.task.done` yet), warn the user but keep waiting. Only ask about killing if it exceeds 60 minutes. Do not auto-kill.
 
 ## Step 8: Merge Results
 
@@ -463,3 +480,30 @@ git worktree list | grep "wt-"
 git worktree remove <path>
 git branch -d wt/<slug>
 ```
+
+## Hook installation
+
+The `task-monitor` window relies on a Claude Code `Notification` hook that timestamps each "awaiting input" prompt to `~/.cache/cc-monitor/<pane>.json`. The hook script ships in this repo at `hooks/cc-monitor-notify.sh`.
+
+Wire it up in `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /path/to/taskestro/hooks/cc-monitor-notify.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Replace `/path/to/taskestro` with the directory you cloned this repo into. Restart Claude Code for the hook to take effect.
+
+Without this hook the monitor still shows tasks (it discovers them by tmux pane path) — but the `awaiting-input` state and elapsed-time-since-prompt columns will be empty.

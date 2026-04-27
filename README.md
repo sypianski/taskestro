@@ -57,7 +57,7 @@ Modes:
 - `task-monitor -w` — refresh every 2s until Ctrl-C (what the orchestrator uses)
 - `task-monitor --bar` — one-line summary for tmux status bar
 
-See [`task-monitor.fish`](https://github.com/sypianski/dotfiles/blob/master/fish/functions/task-monitor.fish) and the [`cc-monitor-notify.sh` hook](https://github.com/sypianski/dotfiles/blob/master/hooks/cc-monitor-notify.sh) in `sypianski/dotfiles`.
+See [`scripts/task-monitor.fish`](scripts/task-monitor.fish) and the [`hooks/cc-monitor-notify.sh`](hooks/cc-monitor-notify.sh) hook in this repo.
 
 ## Installation
 
@@ -69,6 +69,16 @@ ln -s "$PWD/SKILL.md" ~/.claude/skills/task-orchestrator/SKILL.md
 # 2. Install the monitor (Fish function — required for the live dashboard)
 mkdir -p ~/.config/fish/functions
 ln -s "$PWD/scripts/task-monitor.fish" ~/.config/fish/functions/task-monitor.fish
+
+# 3. Wire up the Notification hook so the monitor sees "awaiting-input" prompts.
+#    Add this to ~/.claude/settings.json under .hooks.Notification:
+#      { "hooks": [ { "type": "command",
+#                     "command": "bash $PWD/hooks/cc-monitor-notify.sh" } ] }
+#    Replace $PWD with the absolute path to this repo. Restart Claude Code.
+
+# 4. (Linux only) Install inotify-tools — required for the push-mode wait loop.
+sudo apt install inotify-tools   # Debian/Ubuntu
+# or: sudo dnf install inotify-tools / brew install fswatch (macOS, see SKILL.md)
 ```
 
 Symlinks keep the installed copy tracking the repo; a plain `cp` works too if you'd rather freeze a snapshot.
